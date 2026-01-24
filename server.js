@@ -2,9 +2,28 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs').promises;
 const path = require('path');
+const admin = require('firebase-admin');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
+
+// Initialize Firebase Admin SDK
+let firestore;
+try {
+  const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS || '{}');
+  
+  if (serviceAccount.project_id) {
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount)
+    });
+    firestore = admin.firestore();
+    console.log('✅ Firebase Admin initialized successfully');
+  } else {
+    console.warn('⚠️ Firebase credentials not found. Submissions will only be saved locally.');
+  }
+} catch (error) {
+  console.error('❌ Failed to initialize Firebase Admin:', error.message);
+}
 
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
@@ -15,7 +34,8 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     message: 'ExamForge Publishing Server is running',
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    firestoreConnected: !!firestore
   });
 });
 
@@ -61,7 +81,7 @@ app.post('/api/publish', async (req, res) => {
   }
 });
 
-// ✅ NEW: Handle exam submission endpoint
+// ✅ UPDATED: Handle exam submission and save to Firestore
 app.post('/api/submit', async (req, res) => {
   try {
     const { examId, answers, submittedAt, timeSpent, studentEmail, studentName } = req.body;
@@ -73,14 +93,10 @@ app.post('/api/submit', async (req, res) => {
     
     console.log(`📬 Received submission for exam: ${examId} from ${studentName}`);
     
-    // Create submissions directory
-    const submissionsDir = path.join(__dirname, 'submissions');
-    await fs.mkdir(submissionsDir, { recursive: true });
-    
     // Create a unique submission ID
     const submissionId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     
-    // Save submission as JSON file
+    // Prepare submission object
     const submission = {
       submissionId,
       examId,
@@ -92,10 +108,23 @@ app.post('/api/submit', async (req, res) => {
       receivedAt: new Date().toISOString()
     };
     
+    // Save to Firestore (primary storage)
+    if (firestore) {
+      try {
+        await firestore.collection('examinee_data').doc(submissionId).set(submission);
+        console.log(`✅ Submission saved to Firestore: ${submissionId}`);
+      } catch (firestoreError) {
+        console.error('❌ Firestore save failed:', firestoreError.message);
+        // Continue to save locally as backup
+      }
+    }
+    
+    // Also save locally as backup
+    const submissionsDir = path.join(__dirname, 'submissions');
+    await fs.mkdir(submissionsDir, { recursive: true });
     const filePath = path.join(submissionsDir, `${submissionId}.json`);
     await fs.writeFile(filePath, JSON.stringify(submission, null, 2), 'utf8');
-    
-    console.log(`✅ Submission saved: ${submissionId}`);
+    console.log(`✅ Submission backed up locally: ${submissionId}`);
     
     res.json({ 
       success: true, 
@@ -108,13 +137,28 @@ app.post('/api/submit', async (req, res) => {
   }
 });
 
-// ✅ NEW: Get all submissions for an exam
+// Get all submissions for an exam (from Firestore)
 app.get('/api/submissions/:examId', async (req, res) => {
   try {
     const { examId } = req.params;
-    const submissionsDir = path.join(__dirname, 'submissions');
     
-    // Read all submission files
+    // Try to get from Firestore first
+    if (firestore) {
+      const snapshot = await firestore.collection('examinee_data')
+        .where('examId', '==', examId)
+        .get();
+      
+      const submissions = [];
+      snapshot.forEach(doc => {
+        submissions.push({ id: doc.id, ...doc.data() });
+      });
+      
+      console.log(`📊 Found ${submissions.length} submissions in Firestore for exam ${examId}`);
+      return res.json({ submissions, count: submissions.length, source: 'firestore' });
+    }
+    
+    // Fallback to local files if Firestore not available
+    const submissionsDir = path.join(__dirname, 'submissions');
     const files = await fs.readdir(submissionsDir).catch(() => []);
     const submissions = [];
     
@@ -129,15 +173,15 @@ app.get('/api/submissions/:examId', async (req, res) => {
       }
     }
     
-    console.log(`📊 Found ${submissions.length} submissions for exam ${examId}`);
-    res.json({ submissions, count: submissions.length });
+    console.log(`📊 Found ${submissions.length} submissions locally for exam ${examId}`);
+    res.json({ submissions, count: submissions.length, source: 'local' });
   } catch (error) {
     console.error('❌ Error fetching submissions:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// List all published exams (for debugging)
+// List all published exams
 app.get('/api/exams', async (req, res) => {
   try {
     const publicDir = path.join(__dirname, 'public', 'exams');
@@ -153,5 +197,6 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 ExamForge Publishing Server running on port ${PORT}`);
   console.log(`📁 Public directory: ${path.join(__dirname, 'public', 'exams')}`);
   console.log(`📬 Submissions directory: ${path.join(__dirname, 'submissions')}`);
+  console.log(`🔥 Firestore connected: ${!!firestore}`);
   console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
 });
